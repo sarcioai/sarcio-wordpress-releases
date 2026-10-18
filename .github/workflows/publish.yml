@@ -1,0 +1,52 @@
+name: publish
+
+# Turns a branch named incoming/<version> into the release <version>, then
+# deletes the branch. The branch is pushed by the plugin's own release
+# workflow with a deploy key; nothing is published unless the zip matches its
+# checksum and carries the version the tag names.
+on:
+  push:
+    branches: ['incoming/**']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the files
+        run: |
+          tag="${BRANCH#incoming/}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$tag' is not a version"
+            exit 1
+          fi
+          version="${tag#v}"
+          cd files
+          [ -f "sarcio-$version.zip" ] || { echo "::error::sarcio-$version.zip is missing"; exit 1; }
+          sha256sum --check --strict "sarcio-$version.zip.sha256"
+          cmp -s "sarcio-$version.zip" sarcio.zip || { echo "::error::sarcio.zip differs from sarcio-$version.zip"; exit 1; }
+          unzip -p "sarcio-$version.zip" sarcio/sarcio.php | grep -q "^ \* Version: *$version\$" || { echo "::error::the zip's plugin header does not say $version"; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" files/sarcio.zip "files/sarcio-$VERSION.zip" "files/sarcio-$VERSION.zip.sha256" --target main \
+            --title "Sarcio $VERSION" \
+            --notes "Sarcio plugin $VERSION for a manual install: upload sarcio.zip under Plugins → Add New Plugin → Upload Plugin, activate, then click Connect to Sarcio. The SHA-256 of the zip is in the .sha256 file. What changed: https://www.sarcio.io/wordpress#whats-new"
+
+      - name: Remove the hand-off branch
+        if: always()
+        run: git push origin --delete "$BRANCH"
