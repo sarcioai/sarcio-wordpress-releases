@@ -1,9 +1,23 @@
 name: publish
 
-# Turns a branch named incoming/<version> into the release <version>, then
-# deletes the branch. The branch is pushed by the plugin's own release
-# workflow with a deploy key; nothing is published unless the zip matches its
-# checksum and carries the version the tag names.
+# The publish workflow of sarcioai/sarcio-wordpress-releases (this file is kept
+# in sarcio-wordpress as the source; copy it to that repository's
+# .github/workflows/publish.yml).
+#
+# Turns a branch named incoming/<tag> into a release, then deletes the branch.
+# The branch is pushed by the plugin repository's release workflows with a
+# deploy key; nothing is published unless the zip matches its checksum and
+# carries the version the tag names.
+#
+#  - incoming/v<version>          the Sarcio plugin: release v<version>, the
+#                                 repository's latest (what /downloads/wordpress serves).
+#  - incoming/advanced-v<version> the Sarcio Advanced add-on, which must also
+#                                 carry Sarcio's release signature on the zip and
+#                                 on latest.json: release advanced-v<version>
+#                                 (never marked latest, so the plugin download
+#                                 is undisturbed), and the rolling release
+#                                 `advanced`, whose assets are what
+#                                 updates.sarcio.io and /downloads/wordpress-advanced serve.
 on:
   push:
     branches: ['incoming/**']
@@ -14,6 +28,9 @@ permissions:
 concurrency:
   group: publish
   cancel-in-progress: false
+
+env:
+  ADVANCED_PUBLIC_KEY: RWQa/RQm8pw/HsNVwsKwCIDcFLpRj+Ytt3/xGmCsA9LMvC0jJN+l5s7d
 
 jobs:
   release:
@@ -26,26 +43,52 @@ jobs:
       - name: Verify the files
         run: |
           tag="${BRANCH#incoming/}"
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          case "$tag" in
+            v*) product=sarcio; version="${tag#v}"; header="sarcio/sarcio.php" ;;
+            advanced-v*) product=sarcio-advanced; version="${tag#advanced-v}"; header="sarcio-advanced/sarcio-advanced.php" ;;
+            *) echo "::error::'$tag' is not a release tag"; exit 1 ;;
+          esac
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::'$tag' is not a version"
             exit 1
           fi
-          version="${tag#v}"
           cd files
-          [ -f "sarcio-$version.zip" ] || { echo "::error::sarcio-$version.zip is missing"; exit 1; }
-          sha256sum --check --strict "sarcio-$version.zip.sha256"
-          cmp -s "sarcio-$version.zip" sarcio.zip || { echo "::error::sarcio.zip differs from sarcio-$version.zip"; exit 1; }
-          unzip -p "sarcio-$version.zip" sarcio/sarcio.php | grep -q "^ \* Version: *$version\$" || { echo "::error::the zip's plugin header does not say $version"; exit 1; }
+          [ -f "$product-$version.zip" ] || { echo "::error::$product-$version.zip is missing"; exit 1; }
+          sha256sum --check --strict "$product-$version.zip.sha256"
+          cmp -s "$product-$version.zip" "$product.zip" || { echo "::error::$product.zip differs from $product-$version.zip"; exit 1; }
+          unzip -p "$product-$version.zip" "$header" | grep -q "^ \* Version: *$version\$" || { echo "::error::the zip's plugin header does not say $version"; exit 1; }
+          if [ "$product" = sarcio-advanced ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null
+            minisign -V -P "$ADVANCED_PUBLIC_KEY" -m "$product-$version.zip"
+            minisign -V -P "$ADVANCED_PUBLIC_KEY" -m latest.json
+            grep -q "\"version\":\"$version\"" latest.json || { echo "::error::latest.json does not name $version"; exit 1; }
+          fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "PRODUCT=$product" >> "$GITHUB_ENV"
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      - name: Publish the release
+      - name: Publish the plugin release
+        if: env.PRODUCT == 'sarcio'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$TAG" files/sarcio.zip "files/sarcio-$VERSION.zip" "files/sarcio-$VERSION.zip.sha256" --target main \
             --title "Sarcio $VERSION" \
             --notes "Sarcio plugin $VERSION for a manual install: upload sarcio.zip under Plugins → Add New Plugin → Upload Plugin, activate, then click Connect to Sarcio. The SHA-256 of the zip is in the .sha256 file. What changed: https://www.sarcio.io/wordpress#whats-new"
+
+      - name: Publish the add-on release
+        if: env.PRODUCT == 'sarcio-advanced'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          versioned=("files/sarcio-advanced-$VERSION.zip" "files/sarcio-advanced-$VERSION.zip.sha256" "files/sarcio-advanced-$VERSION.zip.minisig")
+          gh release create "$TAG" "${versioned[@]}" files/latest.json files/latest.json.minisig --target main --latest=false \
+            --title "Sarcio Advanced $VERSION" \
+            --notes "Sarcio Advanced $VERSION. Install sarcio-advanced-$VERSION.zip from Plugins → Add New Plugin → Upload Plugin. File fixes need the Sarcio sidecar and the keys you enter in its own settings; Additional CSS needs the Sarcio plugin. It then updates itself, checking Sarcio's release signature."
+          gh release view advanced >/dev/null 2>&1 ||
+            gh release create advanced --target main --latest=false --title "Sarcio Advanced (current)" \
+              --notes "The current Sarcio Advanced release, which updates.sarcio.io and www.sarcio.io/downloads/wordpress-advanced serve."
+          gh release upload advanced --clobber files/sarcio-advanced.zip "${versioned[@]}" files/latest.json files/latest.json.minisig
 
       - name: Remove the hand-off branch
         if: always()
